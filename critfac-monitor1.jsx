@@ -1,0 +1,662 @@
+import { useState, useEffect, useRef } from "react";
+
+// ═══ LIF / SNN constants ══════════════════════════════════════════
+const TAU_M = 20, V_REST = -70, V_THRESH = -55, V_RESET = -75;
+const DT = 1.0, REFRAC_T = 5, TAU_LTP = 20, TAU_LTD = 20;
+const W_MAX = 12, W_MIN = 0;
+const N_IN = 6, N_HID = 10, N_OUT = 1, N_TOTAL = N_IN + N_HID + N_OUT;
+
+// ═══ Equipment definitions ════════════════════════════════════════
+const EQ = {
+  generator: {
+    label: "Diesel Generator", icon: "⚡",
+    desc: "Voltage, current, frequency, power factor, coolant temp, oil pressure",
+    channels: [
+      { key:"voltage",  label:"Output Voltage",  unit:"V",   min:370, max:460, nominal:415  },
+      { key:"current",  label:"Load Current",    unit:"A",   min:0,   max:320, nominal:150  },
+      { key:"freq",     label:"Frequency",       unit:"Hz",  min:46,  max:54,  nominal:50.0 },
+      { key:"pf",       label:"Power Factor",    unit:"",    min:0.6, max:1.0, nominal:0.9  },
+      { key:"coolant",  label:"Coolant Temp",    unit:"°C",  min:55,  max:115, nominal:85   },
+      { key:"oil",      label:"Oil Pressure",    unit:"kPa", min:180, max:520, nominal:380  },
+    ],
+    faults: [
+      { id:"freq_droop",  label:"Frequency Droop",     channels:["freq","current"],          action:"Check governor and load balance immediately" },
+      { id:"voltage_sag", label:"Voltage Sag",         channels:["voltage"],                 action:"Check AVR and excitation system" },
+      { id:"overtemp",    label:"Thermal Excursion",   channels:["coolant"],                 action:"Check coolant system — radiator, thermostat, water pump" },
+      { id:"low_oil",     label:"Oil Pressure Low",    channels:["oil"],                     action:"STOP ENGINE — immediate inspection required" },
+      { id:"overload",    label:"Overload Condition",  channels:["current","freq","voltage"], action:"Shed non-essential loads" },
+    ],
+  },
+  ups: {
+    label: "UPS System", icon: "🔋",
+    desc: "Input/output voltage, battery SoC, load percentage, temperature, transfer time",
+    channels: [
+      { key:"input_v",  label:"Input Voltage",    unit:"V",   min:370, max:460, nominal:415 },
+      { key:"output_v", label:"Output Voltage",   unit:"V",   min:400, max:440, nominal:420 },
+      { key:"battery",  label:"Battery SoC",      unit:"%",   min:0,   max:100, nominal:100 },
+      { key:"load",     label:"Load",             unit:"%",   min:0,   max:100, nominal:55  },
+      { key:"temp",     label:"Battery Temp",     unit:"°C",  min:10,  max:50,  nominal:24  },
+      { key:"xfer",     label:"Transfer Time",    unit:"ms",  min:0,   max:25,  nominal:2   },
+    ],
+    faults: [
+      { id:"mains_loss",  label:"Mains Failure",       channels:["input_v"],        action:"On battery — verify generator start, check runtime" },
+      { id:"batt_low",    label:"Battery Critical",    channels:["battery"],        action:"Initiate controlled shutdown procedure" },
+      { id:"overload",    label:"Overload",            channels:["load"],           action:"Identify and shed non-critical loads" },
+      { id:"overtemp",    label:"Battery Thermal",     channels:["temp"],           action:"Check ventilation — potential cell failure" },
+      { id:"xfer_slow",   label:"Slow Transfer",       channels:["xfer"],           action:"Test transfer switch — may need service" },
+    ],
+  },
+  threephase: {
+    label: "Three-Phase Distribution", icon: "🔌",
+    desc: "L1/L2/L3 voltage and current — imbalance, overcurrent, supply faults",
+    channels: [
+      { key:"l1v", label:"L1 Voltage",  unit:"V",  min:200, max:260, nominal:230 },
+      { key:"l2v", label:"L2 Voltage",  unit:"V",  min:200, max:260, nominal:230 },
+      { key:"l3v", label:"L3 Voltage",  unit:"V",  min:200, max:260, nominal:230 },
+      { key:"l1i", label:"L1 Current",  unit:"A",  min:0,   max:220, nominal:90  },
+      { key:"l2i", label:"L2 Current",  unit:"A",  min:0,   max:220, nominal:90  },
+      { key:"l3i", label:"L3 Current",  unit:"A",  min:0,   max:220, nominal:90  },
+    ],
+    faults: [
+      { id:"imbalance",   label:"Phase Imbalance",     channels:["l1v","l2v","l3v"],         action:"Check neutral conductor integrity and balanced loading" },
+      { id:"undervolt",   label:"Undervoltage",        channels:["l1v","l2v","l3v"],         action:"Check upstream supply and transformer taps" },
+      { id:"overcurrent", label:"Overcurrent",         channels:["l1i","l2i","l3i"],         action:"Identify overloaded circuits — check downstream protection" },
+      { id:"phase_loss",  label:"Phase Loss",          channels:["l1v","l2v","l3v"],         action:"ISOLATE — check upstream breaker and fuse gear" },
+    ],
+  },
+};
+
+// ═══ Demo data generator ══════════════════════════════════════════
+function genDemo(type) {
+  const eq = EQ[type];
+  const out = [];
+  const N = 900; // 180s @ 200ms
+  for (let i = 0; i < N; i++) {
+    const t = i * 200;
+    const row = { t };
+    eq.channels.forEach(ch => {
+      let v = ch.nominal + (Math.random() - 0.5) * (ch.max - ch.min) * 0.006;
+      if (t > 60000) {
+        if (type === 'generator') {
+          if (t > 70000 && t < 95000) {
+            const s = Math.sin(((t - 70000) / 25000) * Math.PI);
+            if (ch.key === 'freq')    v -= s * 3.8;
+            if (ch.key === 'voltage') v -= s * 18;
+            if (ch.key === 'current') v += s * 55;
+          }
+          if (t > 120000 && ch.key === 'coolant') v += ((t - 120000) / 1000) * 0.35;
+          if (t > 150000 && ch.key === 'oil')     v -= ((t - 150000) / 1000) * 1.2;
+        } else if (type === 'ups') {
+          if (t > 70000 && t < 105000) {
+            if (ch.key === 'input_v') v = 5 + Math.random() * 10;
+            if (ch.key === 'battery') v = Math.max(55, 100 - ((t - 70000) / 1000) * 1.3);
+            if (ch.key === 'xfer')    v = 2 + Math.random() * 5;
+          }
+          if (t > 130000 && ch.key === 'load') v = Math.min(93, 55 + ((t - 130000) / 1000) * 0.9);
+        } else if (type === 'threephase') {
+          if (t > 75000) {
+            const drift = ((t - 75000) / 1000) * 0.18;
+            if (ch.key === 'l1v') v -= drift * 2.5;
+            if (ch.key === 'l2v') v += drift * 1.8;
+            if (ch.key === 'l3i') v += drift * 4;
+          }
+          if (t > 145000 && t < 148000 && ch.key === 'l2i') v += 95;
+        }
+      }
+      row[ch.key] = Math.max(ch.min, Math.min(ch.max, v));
+    });
+    out.push(row);
+  }
+  return out;
+}
+
+// ═══ CSV parser ═══════════════════════════════════════════════════
+function parseCSV(text, channels) {
+  const lines = text.trim().split('\n');
+  const headers = lines[0].split(',').map(h => h.trim().toLowerCase());
+  return lines.slice(1).map((line, i) => {
+    const vals = line.split(',').map(v => parseFloat(v.trim()));
+    const row = { t: i * 200 };
+    channels.forEach(ch => {
+      const idx = headers.indexOf(ch.key.toLowerCase());
+      row[ch.key] = (idx >= 0 && !isNaN(vals[idx])) ? vals[idx] : ch.nominal;
+    });
+    return row;
+  });
+}
+
+// ═══ SNN ═════════════════════════════════════════════════════════
+function makeSNN() {
+  const neurons = Array.from({ length: N_TOTAL }, () => ({
+    v: V_REST, refrac: 0, spiked: false,
+    xPre: 0, xPost: 0,
+    rateWin: new Array(100).fill(0),
+  }));
+  const edges = [];
+  for (let i = 0; i < N_IN;  i++) for (let h = 0; h < N_HID; h++) edges.push({ f: i,        t: N_IN + h,          w: 3 + Math.random() * 5 });
+  for (let h = 0; h < N_HID; h++) edges.push({ f: N_IN + h, t: N_IN + N_HID, w: 3 + Math.random() * 5 });
+  const weights = new Float32Array(edges.map(e => e.w));
+  return { neurons, edges, weights, ltpN: 0, ltdN: 0 };
+}
+
+function snnStep(snn, inputVals, channels, learn) {
+  const { neurons, edges, weights } = snn;
+  const Isyn = new Float32Array(N_TOTAL);
+  const dPre = Math.exp(-DT / TAU_LTP), dPost = Math.exp(-DT / TAU_LTD);
+
+  for (let i = 0; i < N_TOTAL; i++) {
+    neurons[i].xPre  *= dPre;
+    neurons[i].xPost *= dPost;
+    neurons[i].spiked = false;
+  }
+
+  // Poisson input encoding
+  for (let i = 0; i < N_IN; i++) {
+    const ch = channels[i];
+    const norm = Math.max(0, Math.min(1, (inputVals[i] - ch.min) / (ch.max - ch.min)));
+    const rate = 10 + norm * 90; // 10–100 Hz
+    if (Math.random() < (rate / 1000) * DT) Isyn[i] += 16;
+  }
+
+  const fired = [];
+  for (let i = 0; i < N_TOTAL; i++) {
+    const n = neurons[i];
+    if (n.refrac > 0) { n.refrac -= DT; n.v = V_RESET; continue; }
+    n.v += (DT / TAU_M) * (-(n.v - V_REST) + Isyn[i] + (Math.random() - 0.5) * 1.5);
+    n.v = Math.max(V_RESET - 5, Math.min(n.v, V_THRESH + 2));
+    if (n.v >= V_THRESH) {
+      n.spiked = true; n.v = V_RESET; n.refrac = REFRAC_T;
+      n.xPre += 1; n.xPost += 1;
+      fired.push(i);
+    }
+    n.rateWin.push(n.spiked ? 1 : 0);
+    if (n.rateWin.length > 100) n.rateWin.shift();
+  }
+
+  for (const fi of fired) {
+    for (let e = 0; e < edges.length; e++) {
+      if (edges[e].f === fi) {
+        Isyn[edges[e].t] += weights[e] * 3;
+        if (learn) {
+          // LTD: pre fired, depress if post was recently active
+          const dw = 0.009 * neurons[edges[e].t].xPost;
+          if (dw > 0.0001) { weights[e] = Math.max(W_MIN, weights[e] - dw); snn.ltdN++; }
+        }
+      }
+      if (learn && edges[e].t === fi) {
+        // LTP: post fired, potentiate if pre was recently active
+        const dw = 0.008 * neurons[edges[e].f].xPre;
+        if (dw > 0.0001) { weights[e] = Math.min(W_MAX, weights[e] + dw); snn.ltpN++; }
+      }
+    }
+  }
+}
+
+function getRates(snn) {
+  return Array.from({ length: N_TOTAL }, (_, i) => {
+    const w = snn.neurons[i].rateWin;
+    return w.reduce((a, b) => a + b, 0) / w.length;
+  });
+}
+
+// ═══ Claude explanation ═══════════════════════════════════════════
+async function explain(type, deviations, vals, channels) {
+  const eq = EQ[type];
+  const readings = channels.map((ch, i) => `${ch.label}: ${vals[i]?.toFixed(2)}${ch.unit}`).join(', ');
+  const devStr   = deviations.map(d => `${d.ch.label} ${(d.dev * 100).toFixed(1)}% from nominal`).join(', ');
+  try {
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514", max_tokens: 130,
+        messages: [{
+          role: "user",
+          content: `You are a critical facilities engineer. Equipment: ${eq.label}.
+Anomaly detected — ${devStr}. Readings: ${readings}.
+In 2 sentences only: (1) what is most likely happening, (2) immediate action required.
+Direct. No fluff. Engineer to engineer.`
+        }]
+      })
+    });
+    const data = await res.json();
+    return data.content?.[0]?.text || null;
+  } catch { return null; }
+}
+
+function fallbackExplain(ch, type) {
+  const fault = EQ[type].faults.find(f => f.channels.includes(ch.key));
+  return fault ? `${fault.label} on ${ch.label}. ${fault.action}.` : `Anomaly on ${ch.label}. Investigate immediately.`;
+}
+
+// ═══ Main component ═══════════════════════════════════════════════
+const SC = { GREEN:"#00C060", AMBER:"#FFB020", RED:"#FF3030" };
+const SB = { GREEN:"rgba(0,192,96,0.1)", AMBER:"rgba(255,176,32,0.1)", RED:"rgba(255,48,48,0.12)" };
+const SL = { GREEN:"NORMAL OPERATION", AMBER:"ANOMALY DETECTED", RED:"CRITICAL — ACTION REQUIRED" };
+
+export default function CritFacMonitor() {
+  const [phase, setPhase]         = useState('setup');
+  const [eqType, setEqType]       = useState(null);
+  const [dataSrc, setDataSrc]     = useState('demo');
+  const [csvData, setCsvData]     = useState(null);
+  const [progress, setProgress]   = useState(0);
+  const [status, setStatus]       = useState('GREEN');
+  const [score, setScore]         = useState(0);
+  const [liveVals, setLiveVals]   = useState([]);
+  const [alerts, setAlerts]       = useState([]);
+  const [trainStats, setTrainStats] = useState({ n:0, ltp:0, ltd:0 });
+  const [monStats, setMonStats]   = useState({ n:0 });
+
+  const snnRef      = useRef(null);
+  const baseRef     = useRef(null);
+  const dataRef     = useRef([]);
+  const idxRef      = useRef(0);
+  const timerRef    = useRef(null);
+  const lastAlertT  = useRef(0);
+  const eq = eqType ? EQ[eqType] : null;
+
+  const clearTimer = () => { clearTimeout(timerRef.current); clearInterval(timerRef.current); };
+
+  // ── CSV upload ────────────────────────────────────────────────
+  const handleFile = e => {
+    const f = e.target.files[0]; if (!f) return;
+    const r = new FileReader();
+    r.onload = ev => setCsvData(parseCSV(ev.target.result, EQ[eqType].channels));
+    r.readAsText(f);
+  };
+
+  // ── Start training ────────────────────────────────────────────
+  const startTraining = () => {
+    clearTimer();
+    snnRef.current = makeSNN();
+    dataRef.current = dataSrc === 'demo' ? genDemo(eqType) : (csvData || genDemo(eqType));
+    idxRef.current = 0;
+    setPhase('training');
+    setProgress(0);
+    setTrainStats({ n:0, ltp:0, ltd:0 });
+    setAlerts([]);
+    setScore(0);
+    setStatus('GREEN');
+  };
+
+  // ── Training loop ─────────────────────────────────────────────
+  useEffect(() => {
+    if (phase !== 'training' || !eqType) return;
+    const TRAIN_N = 300; // 60s of demo data
+    const channels = EQ[eqType].channels;
+    let sid = 0;
+    const tick = () => {
+      if (sid >= TRAIN_N) {
+        baseRef.current = { rates: getRates(snnRef.current) };
+        setPhase('monitoring');
+        idxRef.current = TRAIN_N;
+        return;
+      }
+      const row = dataRef.current[sid];
+      if (row) {
+        const vals = channels.map(ch => row[ch.key] ?? ch.nominal);
+        for (let t = 0; t < 25; t++) snnStep(snnRef.current, vals, channels, true);
+      }
+      sid++;
+      setProgress(Math.round((sid / TRAIN_N) * 100));
+      setTrainStats({ n: sid, ltp: snnRef.current.ltpN, ltd: snnRef.current.ltdN });
+      timerRef.current = setTimeout(tick, 25);
+    };
+    timerRef.current = setTimeout(tick, 100);
+    return clearTimer;
+  }, [phase, eqType]);
+
+  // ── Monitoring loop ───────────────────────────────────────────
+  useEffect(() => {
+    if (phase !== 'monitoring' || !eqType) return;
+    const channels = EQ[eqType].channels;
+    const TRAIN_N = 300;
+    let sid = idxRef.current;
+
+    const tick = () => {
+      const row = dataRef.current[sid % dataRef.current.length];
+      sid++;
+      if (!row) { timerRef.current = setTimeout(tick, 200); return; }
+
+      const vals = channels.map(ch => row[ch.key] ?? ch.nominal);
+      for (let t = 0; t < 25; t++) snnStep(snnRef.current, vals, channels, false);
+
+      setLiveVals([...vals]);
+      setMonStats(prev => ({ n: prev.n + 1 }));
+
+      // Anomaly score
+      if (baseRef.current) {
+        const cur = getRates(snnRef.current);
+        const base = baseRef.current.rates;
+        let dev = 0;
+        for (let i = 0; i < N_TOTAL; i++) {
+          dev += Math.abs(cur[i] - base[i]) / Math.max(0.005, base[i]);
+        }
+        const sc = Math.min(100, Math.round((dev / N_TOTAL) * 80));
+        setScore(sc);
+        const st = sc < 25 ? 'GREEN' : sc < 60 ? 'AMBER' : 'RED';
+        setStatus(st);
+
+        if (st !== 'GREEN' && Date.now() - lastAlertT.current > 9000) {
+          lastAlertT.current = Date.now();
+          const devs = channels
+            .map((ch, i) => ({ ch, dev: Math.abs(vals[i] - ch.nominal) / (ch.max - ch.min) }))
+            .filter(d => d.dev > 0.04)
+            .sort((a, b) => b.dev - a.dev);
+
+          if (devs.length > 0) {
+            const top = devs[0];
+            const alert = {
+              id: Date.now(),
+              time: new Date().toLocaleTimeString(),
+              severity: st,
+              signal: top.ch.label,
+              value: `${vals[channels.indexOf(top.ch)]?.toFixed(1)}${top.ch.unit}`,
+              nominal: `${top.ch.nominal}${top.ch.unit}`,
+              score: sc,
+              text: null,
+              loading: true,
+            };
+            setAlerts(prev => [alert, ...prev].slice(0, 15));
+            explain(eqType, devs, vals, channels).then(text => {
+              setAlerts(prev => prev.map(a =>
+                a.id === alert.id ? { ...a, text: text || fallbackExplain(top.ch, eqType), loading: false } : a
+              ));
+            });
+          }
+        }
+      }
+
+      timerRef.current = setTimeout(tick, 200);
+    };
+    timerRef.current = setTimeout(tick, 200);
+    return clearTimer;
+  }, [phase, eqType]);
+
+  const reset = () => {
+    clearTimer();
+    setPhase('setup'); setEqType(null); setAlerts([]); setScore(0);
+    setStatus('GREEN'); setProgress(0); setLiveVals([]); setCsvData(null);
+    snnRef.current = null; baseRef.current = null; lastAlertT.current = 0;
+  };
+
+  const sans = "'Segoe UI', system-ui, sans-serif";
+  const mono = "'Courier New', monospace";
+
+  // ════════════════════════════════════════════════════════════════
+  // SETUP SCREEN
+  // ════════════════════════════════════════════════════════════════
+  if (phase === 'setup') return (
+    <div style={{ background:"#03060B", minHeight:"100vh", fontFamily:sans, color:"#E0EFFF", padding:24, boxSizing:"border-box" }}>
+      <div style={{ maxWidth:720, margin:"0 auto" }}>
+
+        <div style={{ marginBottom:32 }}>
+          <div style={{ fontFamily:mono, fontSize:10, color:"#00FFB0", letterSpacing:"0.2em", marginBottom:6 }}>CRITFAC · MONITOR</div>
+          <div style={{ fontSize:28, fontWeight:700, color:"#EDF5FF", marginBottom:8 }}>Neural Anomaly Detection</div>
+          <div style={{ fontSize:14, color:"rgba(160,200,240,0.7)", lineHeight:1.65, maxWidth:540 }}>
+            Learns what your equipment looks like when it's running normally. Flags deviations in real time — before they become failures. No configuration required beyond selecting your equipment type.
+          </div>
+        </div>
+
+        {/* Equipment selector */}
+        <div style={{ marginBottom:28 }}>
+          <Label>What are you monitoring?</Label>
+          <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:10 }}>
+            {Object.entries(EQ).map(([key, e]) => (
+              <button key={key} onClick={() => setEqType(key)} style={{
+                padding:"18px 14px", textAlign:"center",
+                background: eqType===key ? "rgba(0,200,150,0.12)" : "rgba(0,20,50,0.8)",
+                border: `2px solid ${eqType===key ? "#00FFB0" : "rgba(0,70,130,0.5)"}`,
+                borderRadius:10, cursor:"pointer", transition:"border 0.15s",
+              }}>
+                <div style={{ fontSize:30, marginBottom:8 }}>{e.icon}</div>
+                <div style={{ color:eqType===key?"#00FFB0":"#C0D8F0", fontWeight:600, fontSize:14, marginBottom:6 }}>{e.label}</div>
+                <div style={{ color:"rgba(110,160,210,0.6)", fontSize:11, lineHeight:1.45 }}>{e.desc}</div>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Data source */}
+        {eqType && (
+          <div style={{ marginBottom:28 }}>
+            <Label>Data source</Label>
+            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10 }}>
+              {[
+                { key:"demo", label:"Use Demo Data",  sub:"60s normal baseline, then injected faults — ideal for exploring the system" },
+                { key:"csv",  label:"Upload Your CSV", sub:`timestamp,${EQ[eqType].channels.map(c=>c.key).join(',')}` },
+              ].map(opt => (
+                <button key={opt.key} onClick={() => setDataSrc(opt.key)} style={{
+                  padding:"14px 16px", textAlign:"left",
+                  background: dataSrc===opt.key ? "rgba(0,200,150,0.1)" : "rgba(0,15,40,0.8)",
+                  border: `2px solid ${dataSrc===opt.key ? "#00FFB0" : "rgba(0,70,130,0.4)"}`,
+                  borderRadius:8, cursor:"pointer",
+                }}>
+                  <div style={{ color:dataSrc===opt.key?"#00FFB0":"#C0D8F0", fontWeight:600, fontSize:13, marginBottom:5 }}>{opt.label}</div>
+                  <div style={{ color:"rgba(110,160,210,0.55)", fontSize:11, fontFamily:opt.key==='csv'?mono:sans, lineHeight:1.5 }}>{opt.sub}</div>
+                </button>
+              ))}
+            </div>
+            {dataSrc === 'csv' && (
+              <label style={{ display:"block", marginTop:10, padding:"12px 16px",
+                background:"rgba(0,20,50,0.6)", border:"1px dashed rgba(0,100,180,0.4)",
+                borderRadius:6, cursor:"pointer", color:"rgba(120,170,220,0.8)", fontSize:12 }}>
+                {csvData ? `✓ ${csvData.length} samples loaded` : "Click to select CSV file"}
+                <input type="file" accept=".csv" onChange={handleFile} style={{ display:"none" }} />
+              </label>
+            )}
+          </div>
+        )}
+
+        {/* Start */}
+        {eqType && (
+          <button onClick={startTraining} style={{
+            width:"100%", padding:16, fontSize:15, fontWeight:700, fontFamily:sans,
+            background:"rgba(0,200,150,0.12)", border:"2px solid #00FFB0",
+            color:"#00FFB0", borderRadius:8, cursor:"pointer", letterSpacing:"0.04em",
+          }}>
+            START TRAINING →
+          </button>
+        )}
+
+        {/* How it works */}
+        <div style={{ marginTop:28, padding:"16px 18px", background:"rgba(0,15,40,0.6)", border:"1px solid rgba(0,60,110,0.4)", borderRadius:8 }}>
+          <div style={{ fontFamily:mono, fontSize:10, color:"rgba(80,140,200,0.6)", letterSpacing:"0.12em", marginBottom:12 }}>HOW IT WORKS</div>
+          <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:16 }}>
+            {[
+              { n:"01", t:"Training", b:"The system watches 60 seconds of normal operation, learning signal patterns through a spiking neural network with STDP." },
+              { n:"02", t:"Baseline", b:"Synaptic weights adapt to encode the temporal fingerprint of healthy equipment. Weights are then frozen." },
+              { n:"03", t:"Detection", b:"Any deviation from that fingerprint raises an alert — categorised by signal, severity, and recommended action." },
+            ].map(s => (
+              <div key={s.n}>
+                <div style={{ fontFamily:mono, color:"rgba(0,200,150,0.4)", fontSize:10, marginBottom:4 }}>{s.n}</div>
+                <div style={{ color:"#C0D8F0", fontWeight:600, fontSize:12, marginBottom:5 }}>{s.t}</div>
+                <div style={{ color:"rgba(130,170,220,0.6)", fontSize:11, lineHeight:1.55 }}>{s.b}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+
+  // ════════════════════════════════════════════════════════════════
+  // TRAINING SCREEN
+  // ════════════════════════════════════════════════════════════════
+  if (phase === 'training') return (
+    <div style={{ background:"#03060B", minHeight:"100vh", fontFamily:sans, color:"#E0EFFF", padding:24, boxSizing:"border-box" }}>
+      <div style={{ maxWidth:600, margin:"0 auto" }}>
+        <div style={{ fontFamily:mono, fontSize:10, color:"#00FFB0", letterSpacing:"0.2em", marginBottom:28 }}>CRITFAC · MONITOR</div>
+
+        <div style={{ fontSize:24, fontWeight:700, marginBottom:8 }}>Learning Normal Behaviour</div>
+        <div style={{ color:"rgba(160,200,240,0.65)", fontSize:14, marginBottom:36 }}>
+          The neural network is adapting to the operational signature of your {eq.label}. Synaptic weights are adjusting through spike-timing dependent plasticity. This takes about 10 seconds.
+        </div>
+
+        <div style={{ marginBottom:36 }}>
+          <div style={{ display:"flex", justifyContent:"space-between", fontSize:12, color:"rgba(100,160,220,0.7)", marginBottom:8 }}>
+            <span>Training progress</span>
+            <span style={{ fontFamily:mono, color:"#00FFB0" }}>{progress}%</span>
+          </div>
+          <div style={{ background:"rgba(0,30,70,0.6)", borderRadius:5, height:12, overflow:"hidden" }}>
+            <div style={{ height:"100%", width:`${progress}%`, background:"linear-gradient(90deg,#006644,#00FFB0)", borderRadius:5, transition:"width 0.1s" }} />
+          </div>
+        </div>
+
+        <div style={{ marginBottom:28 }}>
+          <div style={{ fontFamily:mono, fontSize:10, color:"rgba(80,140,200,0.6)", letterSpacing:"0.12em", marginBottom:12 }}>SIGNALS BEING LEARNED</div>
+          {eq.channels.map(ch => (
+            <div key={ch.key} style={{ display:"flex", alignItems:"center", gap:14, padding:"9px 0", borderBottom:"1px solid rgba(0,50,90,0.3)" }}>
+              <div style={{ width:8, height:8, borderRadius:"50%", background:"rgba(0,200,150,0.5)", flexShrink:0, animation:"pulse 1.4s infinite" }} />
+              <div style={{ flex:1, fontSize:13, color:"rgba(200,220,240,0.85)" }}>{ch.label}</div>
+              <div style={{ fontFamily:mono, fontSize:11, color:"rgba(90,160,220,0.6)" }}>{ch.nominal}{ch.unit} nominal</div>
+            </div>
+          ))}
+        </div>
+
+        <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:12 }}>
+          {[
+            { l:"Samples processed", v:trainStats.n },
+            { l:"LTP events",        v:trainStats.ltp },
+            { l:"LTD events",        v:trainStats.ltd },
+          ].map(s => (
+            <div key={s.l} style={{ padding:"14px 12px", background:"rgba(0,15,40,0.8)", border:"1px solid rgba(0,60,100,0.35)", borderRadius:8, textAlign:"center" }}>
+              <div style={{ fontFamily:mono, fontSize:20, color:"#00FFB0", marginBottom:5 }}>{s.v.toLocaleString()}</div>
+              <div style={{ fontSize:10, color:"rgba(90,150,200,0.6)" }}>{s.l}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+      <style>{`@keyframes pulse { 0%,100%{opacity:0.35} 50%{opacity:1} }`}</style>
+    </div>
+  );
+
+  // ════════════════════════════════════════════════════════════════
+  // MONITORING SCREEN
+  // ════════════════════════════════════════════════════════════════
+  return (
+    <div style={{ background:"#03060B", minHeight:"100vh", fontFamily:sans, color:"#E0EFFF", padding:16, boxSizing:"border-box" }}>
+
+      {/* Header */}
+      <div style={{ display:"flex", alignItems:"center", gap:14, marginBottom:14, paddingBottom:12, borderBottom:"1px solid rgba(0,70,120,0.3)" }}>
+        <div>
+          <div style={{ fontFamily:mono, fontSize:9, color:"#00FFB0", letterSpacing:"0.2em" }}>CRITFAC · MONITOR</div>
+          <div style={{ fontSize:14, fontWeight:600, color:"#C0D8F0" }}>{eq.label}</div>
+        </div>
+        <div style={{ marginLeft:"auto", display:"flex", gap:10, alignItems:"center" }}>
+          <span style={{ fontFamily:mono, fontSize:10, color:"rgba(70,120,180,0.55)" }}>{monStats.n} samples · SNN active · weights frozen</span>
+          <button onClick={reset} style={{ padding:"5px 12px", background:"rgba(0,30,70,0.6)", border:"1px solid rgba(0,80,140,0.4)", color:"rgba(120,170,220,0.7)", borderRadius:4, cursor:"pointer", fontSize:11 }}>← Reset</button>
+        </div>
+      </div>
+
+      {/* Status banner */}
+      <div style={{ padding:"14px 18px", borderRadius:8, marginBottom:14, background:SB[status], border:`2px solid ${SC[status]}`, display:"flex", alignItems:"center", gap:16 }}>
+        <div style={{ width:14, height:14, borderRadius:"50%", background:SC[status], boxShadow:`0 0 14px ${SC[status]}`, flexShrink:0, animation:status!=='GREEN'?"blink 0.9s infinite":undefined }} />
+        <div style={{ flex:1 }}>
+          <div style={{ fontWeight:700, fontSize:16, color:SC[status] }}>{SL[status]}</div>
+          <div style={{ fontSize:11, color:"rgba(160,200,240,0.55)", marginTop:2, fontFamily:mono }}>
+            Neural anomaly score: {score}% · AMBER &gt;25% · RED &gt;60%
+          </div>
+        </div>
+        <div style={{ width:160, flexShrink:0 }}>
+          <div style={{ display:"flex", justifyContent:"space-between", fontSize:10, fontFamily:mono, color:"rgba(80,130,180,0.5)", marginBottom:4 }}>
+            <span>0</span><span>100%</span>
+          </div>
+          <div style={{ background:"rgba(0,30,70,0.6)", borderRadius:4, height:8, overflow:"hidden" }}>
+            <div style={{ height:"100%", width:`${score}%`, background:SC[status], borderRadius:4, transition:"width 0.3s" }} />
+          </div>
+        </div>
+      </div>
+
+      <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:14 }}>
+
+        {/* Live signals */}
+        <div>
+          <Label>Live Signals</Label>
+          <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
+            {eq.channels.map((ch, i) => {
+              const val = liveVals[i];
+              const norm = val != null ? (val - ch.min) / (ch.max - ch.min) : 0.5;
+              const dev  = val != null ? Math.abs(val - ch.nominal) / (ch.max - ch.min) : 0;
+              const ss   = dev > 0.1 ? 'RED' : dev > 0.04 ? 'AMBER' : 'GREEN';
+              return (
+                <div key={ch.key} style={{ padding:"10px 14px", background:"rgba(0,15,45,0.8)", borderRadius:7, border:`1px solid ${dev>0.04?`${SC[ss]}44`:"rgba(0,60,100,0.4)"}` }}>
+                  <div style={{ display:"flex", justifyContent:"space-between", alignItems:"baseline", marginBottom:7 }}>
+                    <span style={{ fontSize:12, color:"rgba(160,200,240,0.8)" }}>{ch.label}</span>
+                    <span style={{ fontFamily:mono, fontSize:15, fontWeight:700, color:SC[ss] }}>
+                      {val != null ? `${val.toFixed(1)}${ch.unit}` : "—"}
+                    </span>
+                  </div>
+                  <div style={{ background:"rgba(0,25,60,0.6)", borderRadius:3, height:5, overflow:"hidden" }}>
+                    <div style={{ height:"100%", width:`${norm*100}%`, background:SC[ss], borderRadius:3, transition:"width 0.3s" }} />
+                  </div>
+                  <div style={{ display:"flex", justifyContent:"space-between", fontSize:9, color:"rgba(70,120,180,0.45)", marginTop:4, fontFamily:mono }}>
+                    <span>{ch.min}{ch.unit}</span>
+                    <span>nom {ch.nominal}{ch.unit}</span>
+                    <span>{ch.max}{ch.unit}</span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* Fault reference card */}
+          <div style={{ marginTop:12, padding:"12px 14px", background:"rgba(0,15,40,0.7)", border:"1px solid rgba(0,55,100,0.4)", borderRadius:7 }}>
+            <div style={{ fontFamily:mono, fontSize:9, color:"rgba(70,130,190,0.55)", letterSpacing:"0.12em", marginBottom:10 }}>FAULT REFERENCE</div>
+            {eq.faults.map(ft => (
+              <div key={ft.id} style={{ marginBottom:8, paddingBottom:8, borderBottom:"1px solid rgba(0,40,80,0.3)" }}>
+                <div style={{ fontSize:11, fontWeight:600, color:"rgba(200,225,255,0.8)", marginBottom:3 }}>{ft.label}</div>
+                <div style={{ fontSize:11, color:"rgba(255,170,60,0.8)" }}>→ {ft.action}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Alerts */}
+        <div>
+          <Label>Alert Log</Label>
+          {alerts.length === 0 ? (
+            <div style={{ padding:"24px 16px", textAlign:"center", background:"rgba(0,15,40,0.7)", border:"1px solid rgba(0,55,100,0.35)", borderRadius:7 }}>
+              <div style={{ fontSize:28, marginBottom:10 }}>✓</div>
+              <div style={{ color:"rgba(0,200,150,0.8)", fontWeight:600, fontSize:13, marginBottom:4 }}>No anomalies detected</div>
+              <div style={{ color:"rgba(80,140,190,0.5)", fontSize:11 }}>System is monitoring — alerts appear here</div>
+            </div>
+          ) : (
+            <div style={{ display:"flex", flexDirection:"column", gap:10, maxHeight:560, overflowY:"auto" }}>
+              {alerts.map(a => (
+                <div key={a.id} style={{
+                  padding:"13px 15px", borderRadius:7,
+                  background: a.severity==='RED' ? "rgba(255,48,48,0.07)" : "rgba(255,176,32,0.07)",
+                  border: `1px solid ${a.severity==='RED' ? "rgba(255,48,48,0.45)" : "rgba(255,176,32,0.45)"}`,
+                }}>
+                  <div style={{ display:"flex", justifyContent:"space-between", alignItems:"baseline", marginBottom:4 }}>
+                    <span style={{ fontWeight:700, fontSize:13, color:SC[a.severity] }}>{a.severity} · {a.signal}</span>
+                    <span style={{ fontFamily:mono, fontSize:10, color:"rgba(90,140,200,0.55)" }}>{a.time}</span>
+                  </div>
+                  <div style={{ fontFamily:mono, fontSize:10, color:"rgba(150,190,230,0.65)", marginBottom:8 }}>
+                    Measured {a.value} · Nominal {a.nominal} · Score {a.score}%
+                  </div>
+                  <div style={{ fontSize:12, color:"rgba(190,215,245,0.9)", lineHeight:1.6 }}>
+                    {a.loading
+                      ? <span style={{ color:"rgba(100,150,200,0.45)" }}>Analysing fault signature...</span>
+                      : a.text}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+
+      <style>{`@keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.25} }`}</style>
+    </div>
+  );
+}
+
+function Label({ children }) {
+  return (
+    <div style={{ fontFamily:"'Courier New',monospace", fontSize:10, color:"rgba(70,130,190,0.6)", letterSpacing:"0.12em", textTransform:"uppercase", marginBottom:10 }}>
+      {children}
+    </div>
+  );
+}
